@@ -1,0 +1,159 @@
+import 'package:nutrisnap/core/database/cloud/firestore_food_repository.dart';
+import 'package:nutrisnap/core/database/local/hive_food_repository.dart';
+import 'package:nutrisnap/core/services/gemini_service.dart';
+import 'package:nutrisnap/core/services/open_food_facts_service.dart';
+import 'package:nutrisnap/core/utils/result.dart';
+import 'package:nutrisnap/features/nutrition/domain/models/food_item.dart';
+import 'package:nutrisnap/features/nutrition/domain/models/nutrition_analysis_result.dart';
+import 'package:nutrisnap/features/nutrition/domain/repositories/food_repository.dart';
+
+/// Unified NutriSnap Repository coordinating Local (Hive), Cloud (Firestore),
+/// Open Food Facts API, and Gemini AI Vision.
+class NutriSnapRepositoryImpl implements FoodRepository {
+  final FoodRepository _localRepository;
+  final FoodRepository? cloudRepository;
+  final OpenFoodFactsService _openFoodFactsService;
+  final GeminiService _geminiService;
+
+  NutriSnapRepositoryImpl({
+    FoodRepository? localRepository,
+    this.cloudRepository,
+    OpenFoodFactsService? openFoodFactsService,
+    GeminiService? geminiService,
+  })  : _localRepository = localRepository ?? HiveFoodRepository(),
+        _openFoodFactsService = openFoodFactsService ?? OpenFoodFactsServiceImpl(),
+        _geminiService = geminiService ?? GeminiServiceImpl();
+
+  @override
+  Future<Result<void>> saveFoodItem(FoodItem item) async {
+    // 1. Save to local database (Hive)
+    final localResult = await _localRepository.saveFoodItem(item);
+    if (localResult.isFailure) return localResult;
+
+    // 2. Sync to Cloud Firestore if connected
+    if (cloudRepository != null) {
+      cloudRepository!.saveFoodItem(item).ignore();
+    }
+
+    return Result.success(null);
+  }
+
+  @override
+  Future<Result<FoodItem?>> getFoodItemById(String id) async {
+    // Check local database first
+    final localResult = await _localRepository.getFoodItemById(id);
+    if (localResult.isSuccess && localResult.dataOrNull != null) {
+      return localResult;
+    }
+
+    // Fallback to Cloud if not found locally
+    if (cloudRepository != null) {
+      final cloudResult = await cloudRepository!.getFoodItemById(id);
+      if (cloudResult.isSuccess && cloudResult.dataOrNull != null) {
+        // Cache to local
+        await _localRepository.saveFoodItem(cloudResult.dataOrNull!);
+        return cloudResult;
+      }
+    }
+
+    return localResult;
+  }
+
+  @override
+  Future<Result<FoodItem?>> getFoodItemByBarcode(String barcode) async {
+    // 1. Check local Hive cache
+    final cached = await _localRepository.getFoodItemByBarcode(barcode);
+    if (cached.isSuccess && cached.dataOrNull != null) {
+      return cached;
+    }
+
+    // 2. Query Open Food Facts REST API
+    final remoteResult = await _openFoodFactsService.getProductByBarcode(barcode);
+    return remoteResult.when(
+      success: (product) async {
+        // Cache to local Hive and sync to Firestore
+        await saveFoodItem(product);
+        return Result.success(product);
+      },
+      failure: (message, exception) {
+        return Result.failure(message, exception);
+      },
+    );
+  }
+
+  /// AI Food Analysis using Gemini 1.5 Flash Vision
+  Future<Result<NutritionAnalysisResult>> analyzeFoodImage({
+    required List<int> imageBytes,
+    String mimeType = 'image/jpeg',
+    String? userNotes,
+  }) async {
+    final aiResult = await _geminiService.analyzeFoodImage(
+      imageBytes: imageBytes,
+      mimeType: mimeType,
+      userNotes: userNotes,
+    );
+
+    return aiResult.when(
+      success: (analysis) async {
+        // Automatically create and persist FoodItem
+        final foodItem = analysis.toFoodItem();
+        await saveFoodItem(foodItem);
+        return Result.success(analysis);
+      },
+      failure: (msg, ex) => Result.failure(msg, ex),
+    );
+  }
+
+  @override
+  Future<Result<List<FoodItem>>> getAllFoodItems() {
+    return _localRepository.getAllFoodItems();
+  }
+
+  @override
+  Future<Result<List<FoodItem>>> getRecentScans({int limit = 20}) {
+    return _localRepository.getRecentScans(limit: limit);
+  }
+
+  @override
+  Future<Result<void>> deleteFoodItem(String id) async {
+    final localResult = await _localRepository.deleteFoodItem(id);
+    if (cloudRepository != null) {
+      cloudRepository!.deleteFoodItem(id).ignore();
+    }
+    return localResult;
+  }
+
+  @override
+  Future<Result<void>> toggleFavorite(String id) async {
+    final localResult = await _localRepository.toggleFavorite(id);
+    if (cloudRepository != null) {
+      cloudRepository!.toggleFavorite(id).ignore();
+    }
+    return localResult;
+  }
+
+  @override
+  Future<Result<void>> clearAll() async {
+    final local = await _localRepository.clearAll();
+    if (cloudRepository != null) {
+      cloudRepository!.clearAll().ignore();
+    }
+    return local;
+  }
+
+  /// Sync all local Hive items to Cloud Firestore
+  Future<Result<int>> syncLocalToCloud() async {
+    final cloud = cloudRepository;
+    if (cloud is! FirestoreFoodRepository) {
+      return Result.failure('Cloud Firestore ยังไม่ได้เชื่อมต่อ');
+    }
+
+    final localItemsResult = await _localRepository.getAllFoodItems();
+    return localItemsResult.when(
+      success: (items) async {
+        return cloud.syncBatch(items);
+      },
+      failure: (msg, ex) => Result.failure(msg, ex),
+    );
+  }
+}

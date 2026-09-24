@@ -1,0 +1,86 @@
+name: Flutter CI/CD & Automated Test Pipeline
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  lint_and_test:
+    name: Code Analysis & Test Coverage
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: ☕ Setup Java Development Kit
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: 🐦 Setup Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+          cache-key: "flutter-:os:-:channel:-:version:-:arch:-:hash:"
+
+      - name: 📦 Install Flutter Dependencies
+        run: flutter pub get
+
+      - name: 🔍 Static Code Analysis (Linter)
+        run: flutter analyze
+
+      - name: 🧪 Run Automated Tests with Coverage
+        run: flutter test --coverage
+
+      - name: 📊 Verify Minimum 70% Test Coverage
+        run: |
+          sudo apt-get update && sudo apt-get install -y lcov
+          lcov --summary coverage/lcov.info
+          
+          # Extract percentage from lcov summary output
+          COVERAGE=$(lcov --summary coverage/lcov.info | grep "lines......:" | cut -d ' ' -f 4 | cut -d '%' -f 1)
+          echo "Line coverage is: $COVERAGE%"
+          
+          # Assert coverage >= 70%
+          REQUIRED_COVERAGE=70
+          COVERAGE_INT=$(printf "%.0f" "$COVERAGE")
+          if [ "$COVERAGE_INT" -lt "$REQUIRED_COVERAGE" ]; then
+            echo "❌ ERROR: Test coverage ($COVERAGE%) is lower than minimum required ($REQUIRED_COVERAGE%)!"
+            exit 1
+          else
+            echo "✅ SUCCESS: Test coverage ($COVERAGE%) satisfies the requirement (>= $REQUIRED_COVERAGE%)."
+          fi
+
+      - name: 📤 Upload Test Coverage Artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 14
+
+  build_verification:
+    name: Build Verification
+    needs: lint_and_test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🐦 Setup Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: 📦 Install Dependencies
+        run: flutter pub get
+
+      - name: 🛠️ Build Web Artifact
+        run: flutter build web --release
